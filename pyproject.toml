@@ -1,0 +1,7 @@
+[project]
+name = "map-maker"
+version = "0.1.0"
+description = "Minimal verification of the Mapmaker continual-learning architecture"
+readme = "README.md"
+requires-python = ">=3.10"
+

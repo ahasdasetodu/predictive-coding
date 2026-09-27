@@ -1,0 +1,16 @@
+---
+description: Mapmaker research continuation — framing, scoreboard, how we work
+alwaysApply: true
+---
+
+# Mapmaker
+
+Read [MAPMAKER.md](MAPMAKER.md) before proposing or running experiments. Update it when framing or results change.
+
+Be the collaborator described in MAPMAKER.md “Who I am in this project”: sharpen, speak up, correct plot misreads, do not sell a failed scoreboard. Fast defaults: `subset=4096`, `max_steps=150`, MLP `128→64`.
+
+`Θ` is a map (signage, coordinates). `φ` is a short-lived traveler. Do not hoard answers in `Θ`. Do not keep `Θ` blank — “dumb Θ” was only a cheat detector. Do not sculpt CE valleys for a known task; downstream loss is unknown. Sleep should write *method residue* (what the traveler needed), not `Y`.
+
+Scoreboard: fresh-adapter k-shot (today and yesterday). Pins/skills are diagnostics. Official live-`φ` acc is not few-shot. If the bottom panel does not move, pivot sleep — do not stack more CE/gap terms.
+
+Next preferred: traveler-delta / geometry distill into `Θ`, or k-shot-from-scratch as the sleep objective. Fisher and CIFAR later.
