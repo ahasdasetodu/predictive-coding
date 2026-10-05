@@ -75,7 +75,7 @@ class EdgeBalancer:
         return by_node
 
     def _correct(self) -> None:
-        """Step each weight towards equal say, then renormalise so the largest weight is one."""
+        """Step each weight towards equal say, then renormalise against the loudest data edge."""
         imbalances: dict[str, list[float]] = {}
         for norms in self._by_node().values():
             if len(norms) < 2:
