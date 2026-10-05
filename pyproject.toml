@@ -4,4 +4,9 @@ version = "0.1.0"
 description = "Minimal verification of the Mapmaker continual-learning architecture"
 readme = "README.md"
 requires-python = ">=3.10"
+dependencies = [
+    "streamlit>=1.64.0",
+    "torch>=2.14.0",
+    "torchvision>=0.29.0",
+]
 

@@ -1,0 +1,27 @@
+---
+description: Type-annotate all generated code and follow clean-code principles
+alwaysApply: true
+---
+
+# Annotated clean code
+
+Every function, method, and class you write is type-annotated and readable on its own. Use Python 3.10+ syntax (`X | None`, `list[int]`). Use a concrete type; reach for `Any` only at a boundary that has no type.
+
+## Annotations
+
+- Parameters and a return type on every `def`, including `-> None`.
+- Attribute types when the name does not already fix the type (`self.state: Tensor | None`).
+- A one-line docstring on every public function and class stating what it is for. Skip a docstring that only repeats the signature.
+
+```python
+def settle(self, states: list[Tensor], y: Tensor, steps: int, lr: float) -> float:
+    """Relax free states on local energy. Returns the learning rate of the last step."""
+```
+
+## Clean code
+
+- A function does one thing. Split it when the name would need "and".
+- Names say what the value is (`eval_lr`, not `tmp`).
+- A comment records why, and only when the next reader would otherwise guess wrong.
+- Leave the file without debug prints, unused names, or commented-out code.
+- Match the surrounding module. A one-off stays inline.

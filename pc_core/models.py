@@ -1,76 +1,80 @@
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
+from collections.abc import Callable, Sequence
+from typing import Literal
 
-class PClayer(nn.Module):
-    def __init__(self, in_dim, out_dim) -> None:
-        super().__init__()
-        self.layer = nn.Linear(in_dim, out_dim)
-        self.activation = nn.GELU()
-        self.state = None # Re-initialized per batch
+from torch import Tensor, nn
 
-    def init_state(self, batch_size, device, init_value=None, requires_grad=True):
-        if init_value is not None:
-            self.state = init_value.clone().to(device).requires_grad_(requires_grad)
+from pc_core.graph import Edge, GaussianEnergy, PCGraph, squared_error
+
+ActivationFactory = Callable[[], nn.Module]
+EdgeLoss = Callable[[Tensor, Tensor], Tensor]
+InitScheme = Literal["forward", "leapfrog"]
+
+
+def mlp_graph(
+    hidden_dims: int | Sequence[int] = 128,
+    input_dim: int = 28 * 28,
+    output_dim: int = 10,
+    init: InitScheme | None = "forward",
+    output_activation: ActivationFactory = nn.Identity,
+    learn_precision: bool = False,
+    min_log_var: float = -4.0,
+    image_weight: float = 1.0,
+) -> PCGraph:
+    """Generative chain label -> hidden -> image, with optional bottom-up init edges.
+
+    `init="forward"` steps up one node at a time. `init="leapfrog"` jumps two nodes up,
+    then fills the skipped node from the nodes on both sides of it.
+
+    `learn_precision` gives every energy edge its own learned variance instead of a
+    fixed weight of one. Init edges keep squared error; they sit outside the energy.
+
+    `image_weight` scales the energy of the edge into the image. Below one it keeps the
+    784 pixels from dominating settling, which costs the label its say.
+    """
+    widths = [hidden_dims] if isinstance(hidden_dims, int) else list(hidden_dims)
+    if not widths:
+        raise ValueError("hidden_dims must contain at least one width")
+    names = ["label", *(f"h{i + 1}" for i in range(len(widths))), "image"]
+    nodes = dict(zip(names, [output_dim, *widths, input_dim]))
+    # The label and image ends hold data values, so predictions into them are not squashed.
+    end_activation = {"label": output_activation, "image": output_activation}
+
+    def edge(src: str | tuple[str, ...], dst: str, loss: EdgeLoss = squared_error) -> Edge:
+        """Build a linear prediction edge with the activation its destination needs."""
+        sources = (src,) if isinstance(src, str) else src
+        in_dim = sum(nodes[name] for name in sources)
+        activation = end_activation.get(dst, nn.Tanh)
+        return Edge(src, dst, nn.Sequential(nn.Linear(in_dim, nodes[dst]), activation()), loss)
+
+    def energy_loss() -> EdgeLoss:
+        """A fresh loss for one energy edge; each edge owns its own variance."""
+        return GaussianEnergy(min_log_var) if learn_precision else squared_error
+
+    energy_edges = [edge(above, below, energy_loss()) for above, below in zip(names, names[1:])]
+    energy_edges[-1].weight = image_weight
+    bottom_up = names[::-1]
+    if init == "forward":
+        init_edges = [edge(below, above) for below, above in zip(bottom_up, bottom_up[1:])]
+    elif init == "leapfrog":
+        init_edges = _leapfrog_edges(bottom_up, edge)
+    else:
+        init_edges = []
+    return PCGraph(nodes, energy_edges, init_edges)
+
+
+def _leapfrog_edges(
+    bottom_up: list[str],
+    edge: Callable[[str | tuple[str, ...], str], Edge],
+) -> list[Edge]:
+    """Jump from each known node two up, then fill the gap from both sides."""
+    edges: list[Edge] = []
+    i = 0
+    while i < len(bottom_up) - 1:
+        if i + 2 < len(bottom_up):
+            low, mid, high = bottom_up[i : i + 3]
+            edges += [edge(low, high), edge((low, high), mid)]
+            i += 2
         else:
-            self.state = torch.zeros(batch_size, self.layer.out_features, device=device, requires_grad=requires_grad)
-    def forward(self, state_above):
-        if self.state is None:
-            raise RuntimeError("initialise state first")
-        return self.activation(self.layer(state_above))
-
-    def get_energy(self, state_above):
-        if self.state is None:
-            raise RuntimeError("initialise state first")
-        prediction = self.activation(self.layer(state_above))
-        return F.mse_loss(self.state, prediction)
-
-class PCmodel(nn.Module):
-
-    def __init__(self, input_dim=28*28, hidden_dim=128, output_dim=10):
-        super().__init__()
-        # Note: Generative direction is Top (10) -> Hidden (128) -> Bottom (784)
-        self.hidden_layer = PClayer(output_dim, hidden_dim) # Predicts hidden from label
-        self.data_layer = PClayer(hidden_dim, input_dim)    # Predicts data from hidden
-
-    def init_hidden(self, x_data, batch_size, device):
-        # The bottom state is clamped to the actual image data (no gradients needed)
-        self.data_layer.init_state(batch_size, device, init_value=x_data, requires_grad=False)
-        # The hidden state is free to be optimized (requires gradients)
-        self.hidden_layer.init_state(batch_size, device, requires_grad=True)
-
-    def forward(self, y_label):
-        prediction_hidden = self.hidden_layer(y_label)
-        prediction_data = self.data_layer(self.hidden_layer.state)
-        return prediction_hidden, prediction_data
-
-    def get_energy(self, y_label):
-        # Total network energy is the sum of prediction errors at every layer
-        energy_hidden = self.hidden_layer.get_energy(y_label)
-        energy_data = self.data_layer.get_energy(self.hidden_layer.state)
-        return energy_hidden + energy_data
-
-class StatePredictor(nn.Module):
-
-    def __init__(self, upstream_dim, downstream_dim, state_dim) -> None:
-        super().__init__()
-        self.upstream_predictor = nn.Sequential(
-            nn.Linear(upstream_dim, state_dim),
-            nn.GELU()
-        )
-        self.downstream_predictor= nn.Sequential(
-            nn.Linear(downstream_dim, state_dim),
-            nn.GELU()
-        )
-
-        self.state_combiner = nn.Sequential(
-            nn.Linear(2 * state_dim, state_dim),
-            nn.GELU()
-        )
-        
-    def forward(self, upstream_pred, downstream_pred):
-        state1 = self.upstream_predictor(upstream_pred)
-        state2 = self.downstream_predictor(downstream_pred)
-        cat_state = torch.cat([state1,state2], dim=1)
-        return self.state_combiner(cat_state)
-
+            edges.append(edge(bottom_up[i], bottom_up[i + 1]))
+            i += 1
+    return edges
