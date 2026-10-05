@@ -27,7 +27,7 @@ The old MAPMAKER framing is gone and no longer applies. The only rule is `.curso
   - `BalancedRegime`: forward init plus an `EdgeBalancer`, logging `w[edge]` per edge and `imbalance`.
 - `pc_core/balance.py`: `EdgeBalancer` measures the per-sample gradient norm each energy edge imposes on every free node it touches, then steps the weights in log space towards equal norms at each node and renormalises against the loudest edge that touches a clamped node (finding 14). `BalanceConfig(interval=20, step=0.3, momentum=0.5, anchor_data=True)`. Costs one extra backward pass per edge, once every `interval` batches.
 - `pc_core/trainer.py`: generic loop.
-- `main.py`: `--regime zero|forward|balanced`, `--init forward|leapfrog`, `--hidden ...`, `--epochs`, `--eval-steps` (default 30), `--learn-precision`, `--min-log-var`, `--image-weight`. Training settling is fixed at `infer_steps=10`.
+- `main.py`: `--regime zero|forward|balanced`, `--init forward|leapfrog`, `--hidden ...`, `--epochs`, `--eval-steps` (default 1), `--seed`, `--learn-precision`, `--min-log-var`, `--image-weight`. Training settling is fixed at `infer_steps=1`, so findings 8 to 15 are all one-step settling and are not directly comparable to findings 5 to 7, which used 10 and 30.
 - `tests/test_training.py`: 11 tests. `ForwardInitRegimeTests.test_forward_init_starts_at_lower_energy_than_zeros` fails and predates the precision work; the hidden activation is now `nn.Tanh` where this file described GELU, which is the likely cause.
 - `scratch_init_diagnostics.py` (throwaway): per-node gap between init and settled state (teacher-forced and at evaluation) plus accuracy, across depths. `--inits forward forward-matched leapfrog`, `--deep-jumps`, `--infer-steps`, `--seed`. `forward-matched` gives forward edges a hidden layer sized to leapfrog's init parameter count.
 
@@ -126,13 +126,4 @@ Make classification the objective and language an input pathway, so the model le
 
 ## Next steps
 
-- Run `forward-matched` against leapfrog at all depths, with 1, 10 and 30 training settling steps.
-- Check the four-layer forward collapse on seeds 1 and 2.
-- Combine `--deep-jumps --infer-steps 30`.
-- Red-black refinement: alternately update odd and even layers from both neighbours for k rounds. Generalises leapfrog into learned, self-correcting settling (close to red-black Gauss-Seidel).
-- Why balanced and leapfrog conflict (finding 15). Test whether a larger settling budget recovers the combination, and whether the init edges would do better trained against pre-balance settled states.
-- Deep graphs still favour leapfrog with no balancing (84.3% at four hidden layers). Try two-layer jumps plus balanced, and check whether balanced helps leapfrog at all at depths one to three.
-- Check `balanced` against the label-drift curve at 0/5/10/30 eval steps, and on more than one seed.
-- Balance at evaluation currently uses weights calibrated with the label clamped. The measured norms barely differ (finding 12), but worth confirming on deeper graphs.
-- Input-dependent variance only where it is well-posed, meaning edges that share a destination (`msg->z` against `image->z`). Per-coordinate variance on a data edge is closed by finding 10.
-- Later: edges in both directions inside the energy, per-edge loss schemes.
+See `TODO.md`. Keeping the list in one file stops the two drifting apart.
