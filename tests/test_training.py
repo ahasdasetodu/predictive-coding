@@ -1,3 +1,4 @@
+import math
 import unittest
 
 import torch
@@ -7,7 +8,7 @@ from torch.utils.data import DataLoader, TensorDataset
 
 from pc_core.balance import BalanceConfig
 from pc_core.graph import GaussianEnergy
-from pc_core.models import mlp_graph
+from pc_core.models import InitScheme, mlp_graph
 from pc_core.regimes import (
     BalancedRegime,
     EvaluationResult,
@@ -92,6 +93,30 @@ class GraphTests(unittest.TestCase):
             self.assertEqual(set(states), set(graph.nodes))
             for name, width in graph.nodes.items():
                 self.assertEqual(states[name].shape, (5, width))
+
+    def test_skip2_lands_skips_two_up_and_reuses_one_energy_edge(self) -> None:
+        """Cover every node above the image with a skip, and fill the neighbour from above."""
+        graph = mlp_graph(hidden_dims=[7, 5, 3], input_dim=4, output_dim=2, init="skip2")
+        # Bottom-up: image, h3, h2, h1, label. The skip image->h2 runs first, then h2->h3.
+        self.assertEqual(
+            [edge.name for edge in graph.init_edges],
+            ["image->h2", "h2->h3", "h3->h1", "h2->label"],
+        )
+        shared = graph.init_edges[1]
+        energy = next(edge for edge in graph.energy_edges if edge.name == "h2->h3")
+        self.assertIs(shared.module, energy.module)
+        self.assertEqual([edge.name for edge in graph.learned_init_edges()], ["image->h2", "h3->h1", "h2->label"])
+        parameter_ids = [id(parameter) for parameter in graph.parameters()]
+        self.assertEqual(len(parameter_ids), len(set(parameter_ids)))
+
+        for hidden_dims in ([3], [5, 3], [7, 5, 3]):
+            depth = mlp_graph(hidden_dims=hidden_dims, input_dim=4, output_dim=2, init="skip2")
+            states = depth.propagate({"image": torch.randn(5, 4)})
+            self.assertEqual(set(states), set(depth.nodes))
+            label = torch.ones(5, 2)
+            clamped = depth.propagate({"image": torch.randn(5, 4), "label": label})
+            self.assertIs(clamped["label"], label)
+            self.assertEqual(set(clamped), set(depth.nodes))
 
 
 class GaussianEnergyTests(unittest.TestCase):
@@ -210,26 +235,103 @@ class PCRegimeTests(unittest.TestCase):
 
 
 class ForwardInitRegimeTests(unittest.TestCase):
-    """Verify that the init edges learn to start states near where settling ends."""
+    """The init loss classifies from the image and does not copy the settled hidden state."""
 
-    def test_forward_init_starts_at_lower_energy_than_zeros(self) -> None:
-        """After training, propagated states have lower energy than zero states."""
-        torch.manual_seed(7)
-        graph = mlp_graph(hidden_dims=[8], input_dim=6, output_dim=2)
+    def test_extra_loss_is_cross_entropy_from_the_image(self) -> None:
+        """Match summed cross-entropy of the image-only init pass, for every init scheme."""
+        images = torch.randn(5, 6)
+        labels = torch.tensor([0, 2, 1, 1, 0])
+        one_hot = F.one_hot(labels, 3).float()
+        for init in ("forward", "leapfrog", "skip2"):
+            graph = mlp_graph(hidden_dims=[4, 3], input_dim=6, output_dim=3, init=init)
+            regime = ForwardInitRegime(graph, SMALL_CONFIG)
+            settled = {"image": images, "label": one_hot, "h1": torch.randn(5, 4)}
+            loss = regime.extra_loss(settled)
+            logits = graph.propagate({"image": images})["label"]
+            expected = F.cross_entropy(logits, labels, reduction="sum")
+            self.assertAlmostEqual(loss.item(), expected.item(), places=4)
+            moved = dict(settled)
+            moved["h1"] = torch.randn(5, 4)
+            self.assertAlmostEqual(regime.extra_loss(moved).item(), expected.item(), places=4)
+
+    def test_cross_entropy_trains_the_label_path_and_not_a_later_fill(self) -> None:
+        """A leapfrog fill that reads the predicted label is downstream of the loss."""
+        graph = mlp_graph(hidden_dims=[4], input_dim=6, output_dim=3, init="leapfrog")
         regime = ForwardInitRegime(graph, SMALL_CONFIG)
-        prototypes = torch.randn(2, 6)
-        labels = torch.randint(0, 2, (32,))
-        images = prototypes[labels] + 0.1 * torch.randn(32, 6)
-        regime.start_training(epochs=1)
-        for _ in range(100):
-            regime.train_batch((images, labels))
+        images = torch.randn(5, 6)
+        labels = torch.tensor([0, 2, 1, 1, 0])
+        graph.zero_grad()
+        regime.extra_loss({"image": images, "label": F.one_hot(labels, 3).float()}).backward()
+        label_edge = next(edge for edge in graph.init_edges if edge.dst == "label")
+        fill = next(edge for edge in graph.init_edges if edge.dst == "h1")
+        self.assertGreater(float(label_edge.module[0].weight.grad.abs().sum()), 0.0)
+        self.assertIsNone(fill.module[0].weight.grad)
 
-        clamped = {"image": images, "label": F.one_hot(labels, 2).float()}
-        with torch.no_grad():
-            forward_energy = graph.energy(regime.init_states(clamped)).item()
-            zero_energy = graph.energy(PCRegime.init_states(regime, clamped)).item()
+    def test_balanced_regime_uses_the_same_init_loss(self) -> None:
+        """Balanced specs inherit image-only cross-entropy rather than a second init loss."""
+        graph = mlp_graph(hidden_dims=[4], input_dim=6, output_dim=3, init="forward")
+        regime = BalancedRegime(graph, SMALL_CONFIG)
+        images = torch.randn(5, 6)
+        labels = torch.tensor([0, 2, 1, 1, 0])
+        loss = regime.extra_loss({"image": images, "label": F.one_hot(labels, 3).float()})
+        logits = graph.propagate({"image": images})["label"]
+        expected = F.cross_entropy(logits, labels, reduction="sum")
+        self.assertAlmostEqual(loss.item(), expected.item(), places=4)
 
-        self.assertLess(forward_energy, zero_energy)
+
+class MeasurementTests(unittest.TestCase):
+    """Lock the cheap checks that do not train a model."""
+
+    def test_hidden_activation_is_tanh(self) -> None:
+        """Use Tanh on hidden destinations."""
+        graph = mlp_graph(hidden_dims=[4], input_dim=6, output_dim=2)
+        hidden_edges = [edge for edge in graph.energy_edges + graph.init_edges if edge.dst.startswith("h")]
+        self.assertTrue(hidden_edges)
+        for edge in hidden_edges:
+            self.assertIsInstance(edge.module[-1], nn.Tanh)
+
+    def test_leapfrog_init_parameter_ratios(self) -> None:
+        """Match the init-parameter ratios at the four widths in finding 16."""
+        expected = {
+            (128,): 1.077,
+            (256, 128): 2.475,
+            (256, 128, 64): 2.079,
+            (256, 256, 128, 64): 1.832,
+        }
+        for widths, ratio in expected.items():
+            forward = _init_parameters(list(widths), "forward")
+            leapfrog = _init_parameters(list(widths), "leapfrog")
+            self.assertAlmostEqual(leapfrog / forward, ratio, places=3)
+
+    def test_finding_nine_variances_do_not_score_minus_442(self) -> None:
+        """A matched [128] chain at the stated variances does not score -442."""
+        total = _matched_energy(784, 0.27) + _matched_energy(128, 1.0)
+        self.assertAlmostEqual(total, -57.26, places=2)
+        self.assertGreater(abs(total - (-442.0)), 100.0)
+
+    def test_clue_bits(self) -> None:
+        """Inclusive between-4-and-7 is 1.32 bits, and {7, 8, 9} is 1.74 bits."""
+        self.assertAlmostEqual(math.log2(10 / 4), 1.32, places=2)
+        self.assertAlmostEqual(math.log2(10 / 3), 1.74, places=2)
+
+
+def _matched_energy(width: int, variance: float) -> float:
+    """Per-sample GaussianEnergy when the mean square residual equals `variance`."""
+    loss = GaussianEnergy()
+    log_var = math.log(variance)
+    gap = log_var - loss.min_log_var
+    with torch.no_grad():
+        loss.raw_log_var.fill_(loss.min_log_var + math.log(math.expm1(gap)))
+    scale = math.sqrt(variance)
+    prediction = torch.full((1, width), scale)
+    target = torch.zeros(1, width)
+    return float(loss(prediction, target).item())
+
+
+def _init_parameters(hidden: list[int], init: InitScheme) -> int:
+    """Count parameters in the init edges of one graph."""
+    graph = mlp_graph(hidden, init=init)
+    return sum(parameter.numel() for edge in graph.init_edges for parameter in edge.module.parameters())
 
 
 if __name__ == "__main__":

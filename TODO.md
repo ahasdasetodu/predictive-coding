@@ -5,40 +5,29 @@ it only says what to do next and why. Items are roughly in priority order within
 
 ## Where things stand
 
-Best configuration so far, 87.2% validation on MNIST:
+Finding 13's depth table is recorded for seed 0 in `experiments/findings.yaml`. The specs are `experiments/specs/{forward,balanced}-{128,256-128,256-128-64}.yaml`. Seeds 1 and 2 of that table have not been run.
 
-```bash
-uv run main.py --regime balanced --hidden 256 128 --epochs 8
-```
-
-Every number in `NOTES.md` findings 8 to 15 is a single seed with one training settling
-step (`infer_steps=1`, hardcoded in `main.py`) and best-across-epochs validation accuracy.
-Treat all of them as provisional until repeated.
+Every other number in `NOTES.md` findings 8 to 15 is still a single seed with one training settling step (`infer_steps=1`) and no result directory.
 
 ## Broken or stale
 
-- `tests/test_training.py::ForwardInitRegimeTests::test_forward_init_starts_at_lower_energy_than_zeros`
-  fails and predates the precision and balancing work. `mlp_graph` uses `nn.Tanh` for hidden
-  activations where `NOTES.md` described GELU, which is the likely cause. Decide which was
-  intended; the fix is one line either way, but the choice affects every result.
 - `scratch_init_diagnostics.py` predates `--regime balanced` and the precision work, so its
   comparisons no longer cover the current options. Either update it or retire it.
-- `main.py` fixes `infer_steps=1` with no flag. Make it an argument before running anything
-  that depends on the settling budget.
+- `main.py` takes `--infer-steps` (default 1, the value findings 8 to 15 used). Do not hardcode a second settling budget.
 
 ## Balancing: open questions
 
-- **Everything is one seed.** Re-run the depth comparison (finding 13) and the deep-chain
-  comparison (finding 15) on at least three seeds before trusting either.
-- **Why balanced and leapfrog conflict** (finding 15). Two hypotheses worth separating: that
-  a larger settling budget recovers the combination, and that the init edges suffer because
-  balancing moves the settled states they are trained to predict. The second is testable by
-  training the init edges against settled states from a fixed-weight run.
+- **Depth comparison is one seed.** Seed 0 of finding 13 is recorded. Run seeds 1 and 2
+  before treating the gaps as stable. Finding 15, the four-layer leapfrog comparison, still
+  has no result directory.
+- **Why balanced and leapfrog conflict** (finding 15). Those runs trained init edges to copy
+  settled states. The current regime trains them with image-only cross-entropy, so a
+  re-run is a different experiment. The recorded hypothesis was that balancing moves the
+  settled states the init edges were trained to predict.
 - **The balancer has not converged at four hidden layers.** `imbalance` was still 1.22 and
   falling after 20 epochs. Check whether `interval` and `step` need to scale with the number
   of edges, and whether a genuinely converged depth-four state is any good.
-- **Does balanced help leapfrog at all?** Only tested at four hidden layers, where it hurts.
-  Try depths one to three.
+- **Does balanced help leapfrog at depths one to three?** Seed 0, 8 epochs, one settling step is recorded in the `leapfrog-*` and `balanced-leapfrog-*` findings. It helps at one hidden layer, is flat at two, and hurts at three, where plain leapfrog is the best of the four cells. Final imbalance is about 1, so this is not the unconverged four-layer balancer. Finding 15's four-layer, 20-epoch grid still has no result directory.
 - **Label drift under balanced.** Run the 0/5/10/30 eval-step curve (finding 4) with
   `--regime balanced` to see how much of the remaining 2.5-point cost it removes.
 - **Evaluation uses weights calibrated with the label clamped.** The measured norms barely
@@ -46,43 +35,44 @@ Treat all of them as provisional until repeated.
 - **Combine with two-layer jumps.** The `--deep-jumps` path in the scratch script and
   `--regime balanced` are the two best interventions found and have never been run together.
 
-## Build: language as a byproduct
+## Language as a byproduct: next
 
-The design is written out in `NOTES.md` under "Planned: language as a byproduct". Stage 1
-in build order:
+Stage 1 (hub) and stage 2 (consensus graph, one seed under occlusion, balancer on/off
+and own-module CE init) are done; `NOTES.md` summarises them. Consensus numbers are the
+`consensus-*` entries in `experiments/findings.yaml`. Specs under
+`experiments/specs/consensus-occlude-14*.yaml`.
 
-1. **`pc_core/messages.py`**: vocabulary and grammar, a sampler that draws a clue type with
-   configurable weights and renders it as one-hot tokens per position, the information content
-   in bits per clue type, and image degradation (`noise`, `occlude`) so clues have something
-   to add.
-2. **`PCGraph.propagate`**: run whichever init edges have their sources available instead of
-   a fixed list order. Required before anything else, because the clamped set now varies per
-   batch and generation runs init edges in both directions.
-3. **`multimodal_graph()` in `pc_core/models.py`**: energy edges `image -> h_img -> z`,
-   `msg -> h_msg -> z`, `z -> label`, plus reverse init edges `z -> image` and `z -> msg` for
-   generation.
-4. **A regime with random clamping.** Each batch, sample which modalities are clamped (image
-   only, message only, both); a missing modality is simply a free node. This is also the
-   fix for finding 4, since training would then practise a free label.
-5. **Evaluation that can support the claim.** Accuracy per clue type, never pooled, plus the
-   three controls: no clue, shuffled clue from another image (accuracy must drop below
-   no-clue), and clue only. The headline output is clue information in bits against accuracy
-   gain, with the Bayes-optimal gain as the ceiling line.
-6. **Input-dependent variance on `msg -> z` and `image -> z`.** This is the one place
-   precision is well-posed, because the two edges share a destination (finding 9). Needed so
-   a vague clue like `even` does not pull `z` as insistently as `is 6`.
-7. **Message decoding, two ways.** By settling a free `msg` node, and by scoring every valid
-   message against `||z - g(m)||^2`. The second gives an exact ranked list, which is both a
-   check on the first and the view into what the model thinks about a borderline image.
+1. **Scale at `s` without the balancer's interior-edge trap.** Stay on shared-init
+   nobalance (`consensus-nobalance-ratio-s`): image vote / clue vote is 1.64, and the
+   `is k` listen is 6.3 points against the hub's 27 at ratio 1.00. Own-module CE init
+   (`consensus-ceinit-does-not-listen`) recovered 89.07% image-only but the clue no
+   longer reaches the label, even at ratio 1.09, so do not switch `share_init` off for
+   language. The balancer cannot be turned back on as-is (`consensus-balancer-collapse`).
+   A scalar on the three vote edges, or a balancer that only sees `z_* -> s`, is the next
+   measurement on the nobalance wiring.
+2. **Input-dependent variance on the hub `z -> msg`.** `hub-gain-by-type`: `between` and
+   `not k or j` make accuracy worse while `is k` gains 27 points, and the ratio at `z` is
+   1.00, so the problem is not scale but that a vague clue pulls `z` toward the mean of its
+   allowed digits as hard as a precise one pins it. `GaussianEnergy` is one scalar per edge
+   today; this needs a module that maps the message to a log-variance.
+3. **Negation on the hub.** `hub-negation-not-learned`: clue-only `not k or j` is 0% on
+   every seed. Try depth in the clue pathway (`msg -> h_msg -> z` as an energy chain) on the
+   hub, where the clue edge still has a say, and keep the per-type clue-only table as the check.
+4. **Describing an image regresses to `not even`/`not odd`** (`hub-describes-images`).
+   Squared error on one-hot tokens predicts the mean message. Candidates: a per-position
+   cross-entropy edge loss for `z -> msg`, or report the ranked list (already in
+   `thoughts.txt`) as the description rather than the single nearest statement.
+5. **Imagined digits are blurred means** (`hub-imagines-from-clues`): the reference misses
+   the prototypes for 1, 4, 5, 8, 9. Committing to the read-off label helps (`between` 81.6 to
+   93.2% in-set). Longer settling at evaluation for the imagine path, and a wider `h_img`, are
+   the cheap knobs; a style part of `z` is the structural one.
+6. **Seeds for the clean hub run** and the noise level, so the degradation comparison is not
+   single-seed.
 
-Note that balancing matters here rather than being a nicety: `msg -> z` and `image -> z`
-compete at the same node, and the whole experiment measures how much the message contributes,
-so an untuned balance between those two edges would silently set the headline result.
+Later stages, once the clue pathway handles vague clues and negation:
 
-Later stages, once stage 1 reads out sensibly:
-
-- **Equations.** `2 + 4` paired with an image of a 6. Needs depth in `h_msg`. The real test is
-  holding out pairs such as `3 + 4` and checking whether 7 is still inferred.
+- **Equations.** `2 + 4` paired with an image of a 6. Needs depth in the clue pathway. The real
+  test is holding out pairs such as `3 + 4` and checking whether 7 is still inferred.
 - **Blob counting.** Images of n blobs on their own node `z -> h_count -> count_image`.
   Hypothesis: digits give `z` arbitrary class identities, blobs force an ordered notion of
   quantity. Measure whether distance between class centroids in `z` tracks numeric difference,

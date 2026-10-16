@@ -1,0 +1,18 @@
+---
+description: Treat findings.yaml as the source of numeric results
+alwaysApply: true
+---
+
+# Experiment findings
+
+Read `experiments/findings.yaml` before treating a number in `NOTES.md` as a fact.
+
+A number is usable when its entry has status `confirmed` and `evidence` is a result directory or a named test. Unverified accuracies must not be cited as results.
+
+A new training run is a YAML spec executed by the runner. The result directory it writes is what gets linked from `findings.yaml`.
+
+```bash
+uv run python -m pc_core.experiment experiments/specs/balanced-256-128.yaml
+```
+
+Do not copy an accuracy into `NOTES.md` by hand. Link the result directory from `findings.yaml`.

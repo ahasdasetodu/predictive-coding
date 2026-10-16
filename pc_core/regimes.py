@@ -1,3 +1,4 @@
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from typing import Protocol
 
@@ -8,7 +9,7 @@ from torch import Tensor, nn
 from torch.optim.lr_scheduler import CosineAnnealingLR
 
 from pc_core.balance import BalanceConfig, EdgeBalancer
-from pc_core.graph import PCGraph, States
+from pc_core.graph import Edge, PCGraph, States
 
 Batch = tuple[Tensor, Tensor]
 
@@ -100,8 +101,15 @@ class PCRegime:
         """Add a loss to the weight step on top of the energy; none by default."""
         return torch.zeros((), device=self.device)
 
+    def current_energy_edges(self) -> Sequence[Edge] | None:
+        """Energy edges for this batch; `None` means every energy edge."""
+        return None
+
     def observe_init(self, states: States) -> None:
         """Hook: inspect the states settling starts from; does nothing by default."""
+
+    def observe_settled(self, settled: States) -> None:
+        """Hook: inspect the settled states before the weight step; does nothing by default."""
 
     def extra_metrics(self) -> dict[str, float]:
         """Add regime-specific values to the training log; none by default."""
@@ -119,18 +127,24 @@ class PCRegime:
             self.input_node: self._flat(x_data),
             self.label_node: self._one_hot(labels),
         }
-        batch_size = x_data.shape[0]
+        return self.train_clamped(clamped)
+
+    def train_clamped(self, clamped: States) -> TrainResult:
+        """Settle the free nodes against `clamped`, then take one weight step."""
+        batch_size = next(iter(clamped.values())).shape[0]
         states = self._free_states(clamped)
         self.observe_init(states)
+        edges = self.current_energy_edges()
         with torch.no_grad():
-            init_energy = self.model.energy(states).item()
+            init_energy = self.model.energy(states, edges).item()
         self.infer_lr = self.settle(
             states, self._free(clamped), self.config.infer_steps, self.config.infer_lr
         )
 
         settled = {name: state.detach() for name, state in states.items()}
+        self.observe_settled(settled)
         self.weight_opt.zero_grad()
-        edge_energies = self.model.edge_energies(settled)
+        edge_energies = self.model.edge_energies(settled, edges)
         energy = torch.stack(list(edge_energies.values())).sum()
         extra = self.extra_loss(settled)
         loss = (energy + extra) / batch_size
@@ -154,16 +168,19 @@ class PCRegime:
         """Settle with only the image clamped and count label argmax hits."""
         x_data, labels = batch
         labels = labels.to(self.device)
-        clamped = {self.input_node: self._flat(x_data)}
-        states = self._free_states(clamped)
-        self.eval_lr = self.settle(
-            states, self._free(clamped), self.config.eval_steps, self.config.eval_lr
-        )
+        states = self.infer({self.input_node: self._flat(x_data)})
         predictions = states[self.label_node].argmax(dim=1)
         return EvaluationResult(
             correct=int((predictions == labels).sum().item()),
             total=labels.size(0),
         )
+
+    def infer(self, clamped: States, steps: int | None = None) -> States:
+        """Settle the free nodes against `clamped` for `steps` (default `eval_steps`) and return every state detached."""
+        states = self._free_states(clamped)
+        count = self.config.eval_steps if steps is None else steps
+        self.eval_lr = self.settle(states, self._free(clamped), count, self.config.eval_lr)
+        return {name: state.detach() for name, state in states.items()}
 
     def end_epoch(self) -> None:
         """Advance the weight schedule after one completed epoch."""
@@ -180,7 +197,7 @@ class PCRegime:
         for _ in range(steps):
             used_lr = state_sched.get_last_lr()[0]
             state_opt.zero_grad()
-            self.model.energy(states).backward()
+            self.model.energy(states, self.current_energy_edges()).backward()
             state_opt.step()
             state_sched.step()
         return used_lr
@@ -213,8 +230,7 @@ class PCRegime:
 
 
 class ForwardInitRegime(PCRegime):
-    """Start states from a bottom-up pass through the init edges, and train those edges
-    to predict where settling ends up."""
+    """Bottom-up init, with that pass trained to classify the image by cross-entropy."""
 
     def init_states(self, clamped: States) -> States:
         """Fill free nodes from the init edges; nodes they do not reach start at zero."""
@@ -223,8 +239,17 @@ class ForwardInitRegime(PCRegime):
         return {**super().init_states(clamped), **proposed}
 
     def extra_loss(self, settled: States) -> Tensor:
-        """Each init edge predicts its settled destination from its settled source."""
-        return self.model.energy(settled, self.model.init_edges)
+        """Cross-entropy of the label predicted from the clamped image alone."""
+        # Settling clamps the label, so the edge that writes it does not run there.
+        # This pass starts from the image and uses the clamped label only as the target.
+        return self.init_label_loss(settled[self.input_node], settled[self.label_node].argmax(dim=1))
+
+    def init_label_loss(self, images: Tensor, labels: Tensor) -> Tensor:
+        """Sum of cross-entropy for the init pass that predicts `labels` from `images` alone."""
+        proposed = self.model.propagate({self.input_node: images})
+        if self.label_node not in proposed:
+            raise ValueError("init edges do not reach the label from the image")
+        return F.cross_entropy(proposed[self.label_node], labels, reduction="sum")
 
 
 class BalancedRegime(ForwardInitRegime):
